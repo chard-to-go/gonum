@@ -20,6 +20,9 @@ const (
 var (
 	_ Matrix    = (*Cholesky)(nil)
 	_ Symmetric = (*Cholesky)(nil)
+
+	// _ Matrix    = (*BandCholesky)(nil)
+	// _ SymBanded = (*BandCholesky)(nil)
 )
 
 // Cholesky is a symmetric positive definite matrix represented by its
@@ -696,4 +699,71 @@ func (c *Cholesky) SymRankOne(orig *Cholesky, alpha float64, x Vector) (ok bool)
 
 func (c *Cholesky) valid() bool {
 	return c.chol != nil && !c.chol.IsEmpty()
+}
+
+type BandCholesky struct {
+	// The chol pointer must never be retained as a pointer outside the Cholesky
+	// struct, either by returning chol outside the struct or by setting it to
+	// a pointer coming from outside. The same prohibition applies to the data
+	// slice within chol.
+	chol *TriBandDense
+	cond float64
+}
+
+func (c *BandCholesky) Factorize(a SymBanded) (ok bool) {
+	n, k := a.SymBand()
+	if c.chol == nil {
+		c.chol = NewTriBandDense(n, k, Upper, nil)
+	} else {
+		c.chol.Reset()
+		c.chol.ReuseAsTriBand(n, k, Upper)
+	}
+	cRaw := c.chol.RawTriBand()
+
+	aMat, _ := untransposeExtract(a)
+	if aSym, ok := aMat.(*SymBandDense); ok {
+		aRaw := aSym.RawSymBand()
+		if aRaw.Uplo == blas.Upper {
+			for i := 0; i < n; i++ {
+				copy(cRaw.Data[i*cRaw.Stride:i*cRaw.Stride+k+1], aRaw.Data[i*aRaw.Stride:i*aRaw.Stride+k+1])
+			}
+		} else {
+			for i := 0; i < n; i++ {
+				for j := 0; j < min(k+1, n-i); j++ {
+					cRaw.Data[i*cRaw.Stride+j] = aRaw.Data[(i+j)*aRaw.Stride+k-j]
+				}
+			}
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			for j := 0; j < k+1; j++ {
+				c.chol.setTriBand(i, i+j, a.At(i, i+j))
+			}
+		}
+	}
+
+	cSym := blas64.SymmetricBand{
+		Uplo:   blas.Upper,
+		N:      n,
+		K:      k,
+		Data:   cRaw.Data,
+		Stride: cRaw.Stride,
+	}
+	work := getFloats(n, false)
+	norm := lapack64.Lansb(CondNorm, cSym, work)
+	putFloats(work)
+	_, ok = lapack64.Pbtrf(cSym)
+	if ok {
+		c.updateCond(norm)
+	} else {
+		c.Reset()
+	}
+	return ok
+}
+
+func (c *BandCholesky) Reset() {
+	if c.chol != nil {
+		c.chol.Reset()
+	}
+	c.cond = math.Inf(1)
 }
